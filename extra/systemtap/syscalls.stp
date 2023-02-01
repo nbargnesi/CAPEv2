@@ -1,0 +1,246 @@
+/*
+ * syscall monitor
+ *
+ * Note, tid() and pid() are equivalent in single-threaded processes. The
+ * syscall instrumentation in this script uses tid() exclusively but the
+ * effect should be the same.
+ */
+
+global start_ts
+global pids%
+global pids_in_exec%
+global target_pid
+
+global syscall_argstrs%
+global syscall_names%
+global syscall_times%
+global syscalls_nonreturn[2]
+
+/**
+ * Returns 1 if pid is a process we're instrumenting, 0 otherwise. Processes
+ * being instrumented are children of target().
+ */
+function instrumenting(pid) {
+    if (pid in pids) return 1
+    return 0
+}
+
+/**
+ * Prints the active probe point.
+ *
+ * E.g.:
+ *   probe:end(0)
+ *   probe:kprobe.function("__x64_sys_write")
+ */
+function trace_probe() {
+    ts_print(sprintf("probe:%s", pp()))
+}
+
+/**
+ * Returns the number of processes being instrumented.
+ */
+function num_pids:long() {
+    x = 0
+# TODO track num_pids when pids changes
+    foreach (_ in pids) x++
+    return x 
+}
+
+/**
+ * Prints the number of processes being instrumented.
+ */
+function report_pids() {
+    ts_print(sprintf("instrumenting %d pid(s)", num_pids()))
+}
+
+/**
+ * Prints the session duration.
+ */
+function report_session_duration() {
+    ts_print(sprintf("session duration: %ds", gettimeofday_s() - start_ts))
+}
+
+/**
+ * Returns a formatted string based upon a timestamp.
+ */
+function format_timestamp:string(ts:long) {
+    dt_ts = ts / 1000000
+    fractional_ts = ts % 1000000
+    return sprintf("%s.%06d", ctime(dt_ts), fractional_ts)
+}
+
+/**
+ * Prints a string prefixed by the current date-time.
+ */
+function ts_print(s:string) {
+    now_str = format_timestamp(gettimeofday_us())
+    printf("%s %s\n", now_str, s)
+}
+
+/**
+ * Prints syscall information.
+ */
+function report_syscall(name, argstr, retstr) {
+    t = tid()
+
+    syscall_time = syscall_times[t]
+    prefix = format_timestamp(syscall_time)
+    delete syscall_times[t]
+
+    /* if we're on a specific thread include thread information */
+    if (!(t in pids)) {
+        prefix .= sprintf(" %s@%x[%d] ", execname(), uaddr(), t)
+    }
+
+    /* replace parens in syscall argument strs with hex equivs */
+    argstr = str_replace(argstr, "(", "\\x28")
+    argstr = str_replace(argstr, ")", "\\x29")
+
+    if (retstr == "")
+        printf("%s %s(%s)\n", prefix, name, argstr)
+    else
+        printf("%s %s(%s) = %s\n", prefix, name, argstr, retstr)
+
+    delete syscall_argstrs[t]
+    delete syscall_names[t]
+}
+
+/**
+ * Initial probe; sets the stage for instrumenting.
+ */
+probe init {
+    start_ts = gettimeofday_s()
+    target_pid = target()
+    pids[target_pid] = 1
+    syscalls_nonreturn["exit"] = 1
+    syscalls_nonreturn["exit_group"] = 1
+}
+
+/**
+ * If the instrumented processes are still running after $1 seconds, this
+ * timer will end the session.
+ */
+probe timer.s($1) {
+    ts_print(sprintf("timer fired (%d seconds), exiting", $1))
+    report_session_duration()
+    exit()
+}
+
+/**
+ * Probes process creation.
+ * 
+ * If a new process starts and its ppid is something we're instrumenting, we'll
+ * watch the new process too.
+ */
+probe process.begin {
+    if ((ppid() in pids)) {
+        pids[pid()] = 1
+        report_pids()
+    }
+}
+
+/**
+ * Probes processes attempting to call exec.
+ *
+ * Any process we're instrumenting that attempts to call exec will trigger a
+ * process.end probe. We want to be aware of this condition so we don't stop
+ * instrumenting a process that isn't actually ending.
+ */
+probe kprocess.exec {
+    trace_probe()
+    if ((pid() in pids)) {
+        /* one of our instrumented pids is exec'ing */
+        pids_in_exec[pid()] = 1
+    }
+}
+
+/**
+ * Probes process termination.
+ * 
+ * Once all processes we're instrumenting terminate, the session ends.
+ */
+probe process.end {
+    /*
+    Ignore instrumented pids calling exec; see the following for details:
+    https://sourceware.org/git/?p=systemtap.git;a=commit;h=a7160c2bec
+    */
+    if ((pid() in pids_in_exec)) {
+        delete pids_in_exec[pid()]
+        next
+    }
+    /* is pid in the pids we're instrumenting? */
+    if ((pid() in pids)) {
+        delete pids[pid()]
+        report_pids()
+    }
+
+    /* pids empty? exit if so */
+    if (num_pids() == 0) {
+        ts_print("all instrumented processes terminated, exiting")
+        report_session_duration()
+        exit()
+    }
+}
+
+/**
+ * When the session begins this probe kicks out the pid being instrumented.
+ */
+probe begin(0) {
+    trace_probe()
+    ts_print(sprintf("instrumenting pid: %d", target_pid))
+    report_pids()
+}
+
+/**
+ * When the session ends this probe kicks out a message indicating
+ * instrumentation of the pid stopped.
+ */
+probe end(0) {
+    trace_probe()
+    ts_print(sprintf("stopped instrumenting pid: %d", target_pid))
+}
+
+/**
+ * Probes syscalls.
+ * 
+ * Any syscalls that didn't (or won't) return are reported for any process
+ * we're instrumenting.
+ */
+probe nd_syscall.* {
+    if (!instrumenting(pid())) next
+
+    t = tid()
+
+    /* last syscall that could've returned didn't */
+    if (syscall_argstrs[t] != "")
+        report_syscall(syscall_names[t], syscall_argstrs[t], "")
+
+    syscall_argstrs[t] = argstr
+    syscall_names[t] = name
+    syscall_times[t] = gettimeofday_us()
+
+    if (name in syscalls_nonreturn)
+        report_syscall(name, argstr, "")
+}
+
+/**
+ * Probes returned syscalls.
+ *
+ * Syscalls are reported for any process we're instrumenting.
+ */
+probe nd_syscall.*.return {
+    if (!instrumenting(pid())) next
+    report_syscall(name, syscall_argstrs[tid()], retstr)
+    /*
+    If execve was called and ENOEXEC is returned, exit the session. Usually
+    this indicates a sample that won't execute due to its binary or unsupported
+    format.
+    */
+    if (name == "execve") {
+        if (errno_str(retval) == "ENOEXEC") {
+            ts_print(sprintf("execve failed (%d), exiting", retval))
+            report_session_duration()
+            exit()
+        }
+    }
+}
