@@ -3,7 +3,11 @@ name: Python tests on windows
 env:
   COLUMNS: 120
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [ master, staging ]
+  pull_request:
+    branches: [ master, staging ]
 
 jobs:
   test:
